@@ -1,0 +1,26 @@
+# 测谎系统 - Python 依赖
+# 运行后端与各 service 所需；OpenFace 为独立 C++ 项目，见 docs/OPENSOURCE_STACK.md
+
+# API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.9
+
+# 数据与配置
+pydantic>=2.0.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+
+# 语义全文分析：本地 Qwen2.5-1.5B-Instruct（首次点击按钮时自动下载 ~3GB）
+transformers>=4.40.0
+accelerate>=0.27.0
+# 语调：DistilHuBERT（可选，按需取消注释）
+# librosa>=0.10.0
+
+# rPPG 备选（可选，选其一接入 facephys_service）
+# pyvhr
+# vitallens
+# advanced-rppg
+
+# 存储（可选）
+# aiosqlite
