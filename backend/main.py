@@ -33,6 +33,24 @@ app.include_router(reports.router_sessions)
 app.include_router(reports.router_reports)
 app.include_router(analyze.router)
 
+
+@app.on_event("startup")
+def _warmup_models():
+    """后台预热 STT 模型到 GPU。Qwen3-4B 按需加载（分析时自动切换显存）。"""
+    import threading
+    def _load():
+        try:
+            import logging
+            log = logging.getLogger(__name__)
+
+            from backend.services.stt_service import _get_models
+            log.info("预热 FireRedASR2-AED + FireRedPunc …")
+            _get_models()
+            log.info("STT 预热完成 ✓ (Qwen3-4B 将在分析时按需加载到 GPU)")
+        except Exception:
+            logging.getLogger(__name__).exception("模型预热异常")
+    threading.Thread(target=_load, daemon=True).start()
+
 frontend_dir = PROJECT_ROOT / "frontend"
 
 
@@ -45,7 +63,7 @@ def health():
 def static_css(path: str):
     f = frontend_dir / "css" / path
     if f.exists():
-        return FileResponse(str(f))
+        return FileResponse(str(f), headers={"Cache-Control": "no-cache"})
     from fastapi import HTTPException
     raise HTTPException(404)
 
@@ -54,7 +72,7 @@ def static_css(path: str):
 def static_js(path: str):
     f = frontend_dir / "js" / path
     if f.exists():
-        return FileResponse(str(f))
+        return FileResponse(str(f), headers={"Cache-Control": "no-cache"})
     from fastapi import HTTPException
     raise HTTPException(404)
 

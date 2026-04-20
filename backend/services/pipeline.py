@@ -29,10 +29,12 @@ from backend.store import append_timeline_sample
 
 # ── rPPG 参数 ────────────────────────────────────────────────────────────────
 RPPG_FPS = 10.0           # 前端采样频率（100ms 间隔）
-# 需要至少 15s 数据（150 个采样点）才能做 FFT 估计心率
 RPPG_MIN_SAMPLES = 150    # 15s × 10fps
 RPPG_MAX_SAMPLES = 600    # 最多保留 60s 数据
-BPM_MIN, BPM_MAX = 42, 180
+BPM_MIN, BPM_MAX = 50, 180
+# 带通滤波参数（心率频段 0.75–3.0 Hz = 45–180 bpm）
+_BP_LOW = 0.75   # Hz
+_BP_HIGH = 3.0   # Hz
 
 # ── 会话级缓冲 ───────────────────────────────────────────────────────────────
 # session_id -> list[float]，绿色通道均值（10fps）
@@ -53,23 +55,49 @@ def _ensure_green_buf(session_id: str) -> list:
     return _green_buffers[session_id]
 
 
+def _butter_bandpass(data: np.ndarray, low: float, high: float, fs: float, order: int = 3) -> np.ndarray:
+    """Butterworth 带通滤波，去除心率频段外的噪声。"""
+    try:
+        from scipy.signal import butter, filtfilt
+        nyq = 0.5 * fs
+        b, a = butter(order, [low / nyq, high / nyq], btype='band')
+        return filtfilt(b, a, data)
+    except ImportError:
+        return data
+
+
 def _estimate_bpm_from_green(signal: list, fps: float) -> Optional[float]:
-    """对绿色通道序列做 FFT，取心率频段内峰值。"""
+    """对绿色通道序列做带通滤波 + FFT，取心率频段内峰值。"""
     arr = np.array(signal, dtype=float)
     n = len(arr)
     if n < RPPG_MIN_SAMPLES:
         return None
-    # 去线性趋势 + 汉宁窗
-    arr -= np.mean(arr)
+
+    # 1) 去线性趋势（而非仅去均值）
+    x = np.arange(n, dtype=float)
+    coeffs = np.polyfit(x, arr, 1)
+    arr -= np.polyval(coeffs, x)
+
+    # 2) 带通滤波：只保留心率频段 (0.75–3.0 Hz)
+    arr = _butter_bandpass(arr, _BP_LOW, _BP_HIGH, fps)
+
+    # 3) 汉宁窗 + FFT
     arr *= np.hanning(n)
-    # FFT
     fft_vals = np.fft.rfft(arr)
     freqs = np.fft.rfftfreq(n, d=1.0 / fps)
     mask = (freqs >= BPM_MIN / 60.0) & (freqs <= BPM_MAX / 60.0)
     if not np.any(mask):
         return None
     power = np.abs(fft_vals[mask]) ** 2
-    peak_freq = freqs[mask][np.argmax(power)]
+
+    # 4) 对 60–100 bpm 范围（正常静息心率）施加轻微加权，抑制边缘异常峰
+    masked_freqs = freqs[mask]
+    weight = np.ones_like(power)
+    normal_mask = (masked_freqs >= 1.0) & (masked_freqs <= 1.67)  # 60–100 bpm
+    weight[normal_mask] *= 1.3
+    weighted_power = power * weight
+
+    peak_freq = masked_freqs[np.argmax(weighted_power)]
     return float(np.clip(peak_freq * 60.0, BPM_MIN, BPM_MAX))
 
 
@@ -144,7 +172,7 @@ def run_pipeline(
             logger.exception("semantic analysis failed")
 
     result = fuse(expression, heart_rate, tone, semantic)
-    append_timeline_sample(session_id, {
+    sample = {
         "t": _now_iso(),
         "lie_probability": result.lie_probability,
         "expression": result.dimensions.expression,
@@ -152,7 +180,9 @@ def run_pipeline(
         "tone": result.dimensions.tone,
         "semantic": result.dimensions.semantic,
         "semantic_summary": result.semantic_summary,
-    })
+    }
+    sample["emotion_scores"] = result.dimensions.emotion_scores or {}
+    append_timeline_sample(session_id, sample)
     return result
 
 
@@ -163,9 +193,10 @@ def _now_iso() -> str:
 
 def analyze_tone_from_b64(audio_b64: str):
     raw = base64.b64decode(audio_b64)
-    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(raw)
         path = f.name
+    logger.info("analyze_tone_from_b64: saved %d bytes to %s", len(raw), path)
     try:
         return analyze_tone(path)
     finally:

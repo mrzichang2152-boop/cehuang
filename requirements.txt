@@ -14,8 +14,9 @@ opencv-python-headless>=4.8.0
 # 语义全文分析：本地 Qwen2.5-1.5B-Instruct（首次点击按钮时自动下载 ~3GB）
 transformers>=4.40.0
 accelerate>=0.27.0
-# 语调：DistilHuBERT（可选，按需取消注释）
-# librosa>=0.10.0
+# 语调/情绪：emotion2vec+（9 类情绪）
+funasr>=1.0.0
+modelscope>=1.9.0
 
 # rPPG 备选（可选，选其一接入 facephys_service）
 # pyvhr

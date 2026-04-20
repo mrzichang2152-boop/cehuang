@@ -27,6 +27,7 @@ def fuse(
         heart_rate=heart_rate.heart_rate_score,
         tone=tone.tone_score,
         semantic=semantic.semantic_score,
+        emotion_scores=tone.emotion_scores if tone.emotion_scores else {},
     )
     w = FUSION_WEIGHTS
     lie_probability = (

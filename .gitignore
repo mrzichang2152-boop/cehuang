@@ -20,8 +20,12 @@ data/
 *.pt
 *.bin
 *.safetensors
+*.ckpt
+*.pth
+*.onnx
 models/
 model_cache/
+pretrained_models/
 
 # 日志
 *.log

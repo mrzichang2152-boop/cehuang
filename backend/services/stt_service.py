@@ -1,13 +1,15 @@
 # 测谎系统 - 实时语音转文字服务
-# STT：FunASR Paraformer-zh（专为普通话训练，准确率远超 Whisper small）
-# 说话人：Resemblyzer GE2E + 4 秒音频累积 + 连续 3 次未匹配才建新说话人
+# STT：FireRedASR2-AED (1.1B, CER 3.05%) + FireRedPunc（BERT 标点）
+# 2026 年中文 ASR SOTA，显存 ~5GB，自带 beam search + 时间戳 + 置信度
 
 from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -16,41 +18,85 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ─── FunASR Paraformer-zh ────────────────────────────────────────────────────
-_paraformer_model = None
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PRETRAINED_DIR = _PROJECT_ROOT / "pretrained_models"
+
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+# ─── FireRedASR2-AED + FireRedPunc ───────────────────────────────────────────
+import threading as _threading
+
+_asr_model = None
+_punc_model = None
+_model_lock = _threading.Lock()
 
 
-def _get_paraformer():
-    global _paraformer_model
-    if _paraformer_model is None:
-        try:
-            from funasr import AutoModel
-            logger.info("Loading FunASR paraformer-zh…")
-            _paraformer_model = AutoModel(
-                model="paraformer-zh",
-                model_revision="v2.0.4",
-                disable_update=True,
-            )
-            logger.info("paraformer-zh loaded")
-        except Exception:
-            logger.exception("Failed to load paraformer-zh")
-    return _paraformer_model
+def _get_models():
+    """懒加载 ASR + Punc 到 GPU，返回 (asr, punc) 元组。"""
+    global _asr_model, _punc_model
+    if _asr_model is not None and _punc_model is not None:
+        return _asr_model, _punc_model
+    with _model_lock:
+        if _asr_model is None:
+            try:
+                from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
+                logger.info("Loading FireRedASR2-AED (1.1B) …")
+                cfg = FireRedAsr2Config(
+                    use_gpu=True,
+                    use_half=False,
+                    beam_size=3,
+                    nbest=1,
+                    decode_max_len=0,
+                    softmax_smoothing=1.25,
+                    aed_length_penalty=0.6,
+                    eos_penalty=1.0,
+                    return_timestamp=False,
+                )
+                _asr_model = FireRedAsr2.from_pretrained(
+                    "aed",
+                    str(_PRETRAINED_DIR / "FireRedASR2-AED"),
+                    cfg,
+                )
+                logger.info("FireRedASR2-AED loaded (GPU)")
+            except Exception:
+                logger.exception("Failed to load FireRedASR2-AED")
+        if _punc_model is None:
+            try:
+                from fireredasr2s.fireredpunc.punc import FireRedPunc, FireRedPuncConfig
+                logger.info("Loading FireRedPunc …")
+                _punc_model = FireRedPunc.from_pretrained(
+                    str(_PRETRAINED_DIR / "FireRedPunc"),
+                    FireRedPuncConfig(use_gpu=True),
+                )
+                logger.info("FireRedPunc loaded (GPU)")
+            except Exception:
+                logger.exception("Failed to load FireRedPunc")
+    return _asr_model, _punc_model
 
 
-# ─── Resemblyzer ────────────────────────────────────────────────────────────
-_voice_encoder = None
-
-
-def _get_voice_encoder():
-    global _voice_encoder
-    if _voice_encoder is None:
-        try:
-            from resemblyzer import VoiceEncoder
-            _voice_encoder = VoiceEncoder()
-            logger.info("Resemblyzer VoiceEncoder loaded")
-        except Exception:
-            logger.exception("Failed to load VoiceEncoder")
-    return _voice_encoder
+def _asr_transcribe(wav_path: str) -> str:
+    """调用 FireRedASR2-AED 转写，再用 FireRedPunc 加标点。"""
+    asr, punc = _get_models()
+    if asr is None:
+        return ""
+    try:
+        results = asr.transcribe(["chunk"], [wav_path])
+        if not results or not results[0].get("text"):
+            return ""
+        raw_text = results[0]["text"].strip()
+        if not raw_text:
+            return ""
+        if punc is not None:
+            try:
+                punc_results = punc.process([raw_text])
+                if punc_results and punc_results[0].get("punc_text"):
+                    return punc_results[0]["punc_text"].strip()
+            except Exception:
+                logger.debug("Punc failed, returning raw text", exc_info=True)
+        return raw_text
+    except Exception:
+        logger.exception("FireRedASR2 inference failed")
+        return ""
 
 
 # ─── 音频转换 ────────────────────────────────────────────────────────────────
@@ -65,7 +111,9 @@ def _audio_b64_to_wav(audio_b64: str) -> Optional[str]:
             f.write(raw)
         ret = subprocess.run(
             ["ffmpeg", "-y", "-i", tmp_in,
-             "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out],
+             "-ar", "16000", "-ac", "1",
+             "-acodec", "pcm_s16le",
+             "-f", "wav", tmp_out],
             capture_output=True, timeout=20,
         )
         Path(tmp_in).unlink(missing_ok=True)
@@ -78,198 +126,218 @@ def _audio_b64_to_wav(audio_b64: str) -> Optional[str]:
 
 
 # ─── 幻觉检测 ────────────────────────────────────────────────────────────────
-_HALLUCINATION_RE = re.compile(r'(.{2,8})\1{2,}')  # 2-8字短语重复3次以上
+_HALLUCINATION_RE = re.compile(r'(.{2,8})\1{2,}')
+
+_HALLUCINATION_PHRASES = [
+    '普通话对话', '字幕由', '翻译', '谢谢观看', '点击订阅',
+    '敬请期待', '本期视频', '感谢收看', '关注我们',
+    '字幕组', '制作', '版权', '声明',
+]
+_ALL_PUNCT_RE = re.compile(r'^[\W\s]+$')
+_REPEAT_CHAR_RE = re.compile(r'(.)\1{4,}')
+
+MAX_CHARS_PER_CHUNK = 120
 
 
 def _is_hallucination(text: str) -> bool:
-    if not text or len(text.strip()) < 2:
+    t = text.strip()
+    if not t:
         return True
-    # 重复性短语检测
-    if _HALLUCINATION_RE.search(text):
+    if _ALL_PUNCT_RE.match(t):
         return True
-    # 常见幻觉关键词
-    for pat in ['普通话对话', '字幕由', '翻译', '谢谢观看', '点击订阅']:
-        if pat in text:
+    if _REPEAT_CHAR_RE.search(t):
+        return True
+    if _HALLUCINATION_RE.search(t):
+        return True
+    for pat in _HALLUCINATION_PHRASES:
+        if pat in t:
             return True
+    if len(t) == 1 and t not in '嗯啊哦哈噢唔呢嘛哎吗是的对好':
+        return True
+    if len(t) > MAX_CHARS_PER_CHUNK:
+        logger.debug("hallucination(length): %d chars", len(t))
+        return True
     return False
 
 
-# ─── 说话人识别状态（每会话）────────────────────────────────────────────────
-# session -> list of (normalized_emb_256, label, count)
-_session_speakers: dict[str, list] = {}
-# session -> current speaker label
-_session_cur_speaker: dict[str, str] = {}
-# session -> consecutive non-match count（连续几次没匹配到当前说话人）
-_session_mismatch_cnt: dict[str, int] = {}
-# session -> counter for numbering
-_session_counter: dict[str, int] = {}
-# session -> audio accumulation buffer (list of np.ndarray at 16kHz)
-_session_audio_buf: dict[str, list] = {}
+# ─── 近期输出去重 ─────────────────────────────────────────────────────────────
+import time as _time
+import collections as _collections
 
-# 关键超参数
-SPEAKER_THRESHOLD = 0.72      # 余弦相似度阈值（同人通常 > 0.78，不同人 < 0.65）
-MISMATCH_CONFIRM = 3          # 连续几次未匹配才承认是新说话人
-MAX_SPEAKERS = 6              # 最多识别几个说话人（防止无限分裂）
-AUDIO_BUF_SECONDS = 4         # 音频累积窗口（更长 → 更稳定的嵌入）
+_recent_outputs: dict[str, "_collections.deque"] = {}
+DEDUP_WINDOW_SECS = 30
+DEDUP_SIM_THRESH = 0.85
 
 
-def _load_wav_mono(wav_path: str) -> Optional[tuple[np.ndarray, int]]:
-    try:
-        from scipy.io import wavfile
-        sr, data = wavfile.read(wav_path)
-        if data.ndim > 1:
-            data = data[:, 0]
-        return data.astype(np.float32), sr
-    except Exception:
-        return None
+def _char_sim(a: str, b: str) -> float:
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    return inter / max(min(len(sa), len(sb)), 1)
 
 
-def _embed_audio(audio: np.ndarray, sr: int = 16000) -> Optional[np.ndarray]:
-    """对音频数组提取 Resemblyzer 嵌入。"""
-    try:
-        from resemblyzer import preprocess_wav
-        encoder = _get_voice_encoder()
-        if encoder is None:
-            return None
-        # resemble 期望 float32 PCM 在 [-1,1]
-        wav = audio.astype(np.float32)
-        mx = np.max(np.abs(wav)) + 1e-9
-        if mx > 1.0:
-            wav /= mx
-        # preprocess_wav 接受 np.ndarray
-        processed = preprocess_wav(wav, source_sr=sr)
-        if len(processed) < 1600:
-            return None
-        emb = encoder.embed_utterance(processed).astype(np.float32)
-        norm = np.linalg.norm(emb) + 1e-9
-        return emb / norm
-    except Exception:
-        logger.debug("embed failed", exc_info=True)
-        return None
-
-
-def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))  # 两者已归一化，dot == cos
-
-
-def _identify_speaker(session_id: str, embedding: np.ndarray) -> str:
-    speakers = _session_speakers.setdefault(session_id, [])
-    cur = _session_cur_speaker.get(session_id)
-
-    # ── 与所有已知说话人比较，找最相似的 ──────────────────────────────────
-    best_sim, best_label = -1.0, None
-    for emb, label, _cnt in speakers:
-        s = _cos_sim(embedding, emb)
-        if s > best_sim:
-            best_sim, best_label = s, label
-
-    if best_sim >= SPEAKER_THRESHOLD:
-        # 匹配到现有说话人：更新嵌入，重置不匹配计数
-        _session_mismatch_cnt[session_id] = 0
-        _session_cur_speaker[session_id] = best_label
-        for i, (emb, lbl, cnt) in enumerate(speakers):
-            if lbl == best_label:
-                new_emb = 0.92 * emb + 0.08 * embedding
-                new_emb /= np.linalg.norm(new_emb) + 1e-9
-                speakers[i] = (new_emb.astype(np.float32), lbl, cnt + 1)
-                break
-        return best_label
-
-    # ── 未匹配：累计不匹配次数 ─────────────────────────────────────────────
-    mismatch = _session_mismatch_cnt.get(session_id, 0) + 1
-    _session_mismatch_cnt[session_id] = mismatch
-    logger.debug("speaker mismatch %d/%d (best_sim=%.3f)",
-                 mismatch, MISMATCH_CONFIRM, best_sim)
-
-    if mismatch < MISMATCH_CONFIRM:
-        # 还未确认是新说话人，暂时保持上一个说话人
-        return cur or best_label or "说话人1"
-
-    # ── 连续 N 次未匹配，确认新说话人 ────────────────────────────────────
-    if len(speakers) >= MAX_SPEAKERS:
-        # 已达上限，归入最相近的人
-        _session_mismatch_cnt[session_id] = 0
-        return best_label or speakers[0][1]
-
-    cnt = _session_counter.get(session_id, 0) + 1
-    _session_counter[session_id] = cnt
-    label = f"说话人{cnt}"
-    speakers.append((embedding, label, 1))
-    _session_cur_speaker[session_id] = label
-    _session_mismatch_cnt[session_id] = 0
-    logger.info("new speaker confirmed: %s (best_sim=%.3f)", label, best_sim)
-    return label
+def _is_duplicate(session_id: str, text: str) -> bool:
+    deq = _recent_outputs.setdefault(session_id,
+                                     _collections.deque(maxlen=20))
+    now = _time.time()
+    while deq and now - deq[0][0] > DEDUP_WINDOW_SECS:
+        deq.popleft()
+    for ts, prev in deq:
+        sim = _char_sim(text, prev)
+        if sim >= DEDUP_SIM_THRESH:
+            logger.debug("dedup: sim=%.2f, dropped: %r", sim, text[:20])
+            return True
+    deq.append((now, text))
+    return False
 
 
 # ─── 主入口 ──────────────────────────────────────────────────────────────────
-def transcribe(session_id: str, audio_b64: str) -> dict:
+def transcribe(session_id: str, audio_b64: str, speaker: str = "") -> dict:
+    """转写音频，speaker 由前端根据麦克风来源传入。"""
     wav_path = None
     try:
         wav_path = _audio_b64_to_wav(audio_b64)
         if not wav_path:
-            return {"text": "", "speaker": "", "language": "zh"}
+            return {"text": "", "speaker": speaker, "language": "zh"}
 
-        # ── STT：FunASR Paraformer-zh ────────────────────────────────────────
-        model = _get_paraformer()
-        if model is None:
-            return {"text": "", "speaker": "", "language": "zh"}
+        wav_size = Path(wav_path).stat().st_size if Path(wav_path).exists() else 0
+        logger.info("[STT] wav size=%d bytes, calling FireRedASR2 …", wav_size)
 
-        try:
-            results = model.generate(input=wav_path, batch_size_s=60)
-            raw_text = results[0].get("text", "").strip() if results else ""
-            # Paraformer 以字符为单位输出（字间有空格），合并回连续中文
-            raw_text = raw_text.replace(" ", "")
-        except Exception:
-            logger.exception("paraformer inference failed")
-            raw_text = ""
+        text = _asr_transcribe(wav_path)
+        logger.info("[STT] result: %r", text[:80] if text else "")
 
-        # 过滤幻觉或重复性输出
-        if _is_hallucination(raw_text):
-            logger.debug("hallucination filtered: %r", raw_text)
-            raw_text = ""
+        if _is_hallucination(text):
+            logger.debug("hallucination filtered: %r", text)
+            text = ""
 
-        text = raw_text
+        if text and _is_duplicate(session_id, text):
+            text = ""
+
         if not text:
-            return {"text": "", "speaker": "", "language": "zh"}
+            return {"text": "", "speaker": speaker, "language": "zh"}
 
-        # ── 说话人识别（累积 4s 音频后取嵌入）─────────────────────────────
-        wav_data = _load_wav_mono(wav_path)
-        speaker = _session_cur_speaker.get(session_id, "说话人1")
-
-        if wav_data is not None:
-            audio, sr = wav_data
-            # 将本帧加入会话音频缓冲区
-            buf = _session_audio_buf.setdefault(session_id, [])
-            buf.append(audio)
-            # 只保留最近 AUDIO_BUF_SECONDS 秒的数据
-            max_samples = sr * AUDIO_BUF_SECONDS
-            combined = np.concatenate(buf)
-            if len(combined) > max_samples:
-                combined = combined[-max_samples:]
-                # 重建 buf 以避免无限增长
-                _session_audio_buf[session_id] = [combined]
-
-            embedding = _embed_audio(combined, sr)
-            if embedding is not None:
-                speaker = _identify_speaker(session_id, embedding)
-            elif not _session_speakers.get(session_id):
-                # 第一帧且 Resemblyzer 无法嵌入（音频太短），先用默认
-                _session_counter[session_id] = 1
-                _session_speakers[session_id] = []
-                _session_cur_speaker[session_id] = "说话人1"
-                speaker = "说话人1"
-
-        return {"text": text, "speaker": speaker, "language": "zh"}
+        return {"text": text, "speaker": speaker or "说话人1", "language": "zh"}
 
     except Exception:
         logger.exception("transcribe failed")
-        return {"text": "", "speaker": "", "language": "zh"}
+        return {"text": "", "speaker": speaker, "language": "zh"}
     finally:
         if wav_path:
             Path(wav_path).unlink(missing_ok=True)
 
 
+def transcribe_file(audio_path: str, segment_sec: float = 15.0) -> str:
+    """对完整音频文件做 STT，长音频按 segment_sec 分段逐段转录后拼接。"""
+    wav_path = None
+    try:
+        wav_path = _file_to_wav(audio_path)
+        if not wav_path:
+            return ""
+
+        import wave
+        with wave.open(wav_path, "rb") as wf:
+            n_frames = wf.getnframes()
+            framerate = wf.getframerate()
+        total_dur = n_frames / framerate if framerate > 0 else 0
+        if total_dur <= 0:
+            return ""
+
+        if total_dur <= segment_sec + 2:
+            text = _asr_transcribe(wav_path)
+            return text if not _is_hallucination(text) else ""
+
+        chunk_frames = int(segment_sec * framerate)
+        parts = []
+        offset = 0
+        seg_idx = 0
+        while offset < n_frames:
+            end = min(offset + chunk_frames, n_frames)
+            seg_wav = tempfile.mktemp(suffix=f"_seg{seg_idx}.wav")
+            try:
+                import wave as _wave
+                with _wave.open(wav_path, "rb") as src:
+                    params = src.getparams()
+                    src.setpos(offset)
+                    frames = src.readframes(end - offset)
+                with _wave.open(seg_wav, "wb") as dst:
+                    dst.setparams(params)
+                    dst.writeframes(frames)
+                text = _asr_transcribe(seg_wav)
+                if text and not _is_hallucination(text):
+                    parts.append(text)
+            except Exception:
+                logger.debug("segment %d transcribe error", seg_idx, exc_info=True)
+            finally:
+                Path(seg_wav).unlink(missing_ok=True)
+            offset = end
+            seg_idx += 1
+
+        return "".join(parts)
+    except Exception:
+        logger.exception("transcribe_file failed")
+        return ""
+    finally:
+        if wav_path and Path(wav_path).exists():
+            Path(wav_path).unlink(missing_ok=True)
+
+
+def _file_to_wav(audio_path: str) -> Optional[str]:
+    """将任意格式音频文件转为 16kHz 单声道 WAV。"""
+    try:
+        tmp_out = tempfile.mktemp(suffix=".wav")
+        ret = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(audio_path),
+             "-ar", "16000", "-ac", "1",
+             "-acodec", "pcm_s16le",
+             "-f", "wav", tmp_out],
+            capture_output=True, timeout=60,
+        )
+        if ret.returncode != 0 or not Path(tmp_out).exists():
+            logger.warning("_file_to_wav ffmpeg failed: %s",
+                           (ret.stderr or b"").decode(errors="replace")[:300])
+            return None
+        return tmp_out
+    except Exception:
+        logger.exception("_file_to_wav error")
+        return None
+
+
 def clear_session(session_id: str) -> None:
-    for d in (_session_speakers, _session_cur_speaker, _session_mismatch_cnt,
-              _session_counter, _session_audio_buf):
-        d.pop(session_id, None)
+    _recent_outputs.pop(session_id, None)
+
+
+# ─── GPU 显存管理：STT 卸载 / 恢复 ──────────────────────────────────────────
+_stt_on_gpu = True
+
+
+def offload_stt_from_gpu():
+    """将 FireRedASR2 + Punc 从 GPU 卸载，释放显存给 LLM。"""
+    global _asr_model, _punc_model, _stt_on_gpu
+    if not _stt_on_gpu:
+        return
+    import torch
+
+    with _model_lock:
+        _asr_model = None
+        _punc_model = None
+
+    torch.cuda.empty_cache()
+    _stt_on_gpu = False
+    logger.info("FireRedASR2 + Punc offloaded from GPU, VRAM freed")
+
+
+def reload_stt_to_gpu():
+    """将 FireRedASR2 + Punc 重新加载到 GPU。"""
+    global _asr_model, _punc_model, _stt_on_gpu
+    if _stt_on_gpu:
+        return
+
+    with _model_lock:
+        _asr_model = None
+        _punc_model = None
+
+    _get_models()
+    _stt_on_gpu = True
+
+
+def is_stt_on_gpu() -> bool:
+    return _stt_on_gpu

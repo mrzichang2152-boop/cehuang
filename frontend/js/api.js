@@ -12,11 +12,7 @@ function getWsUrl() {
   const base = getApiBase();
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   if (!base) {
-    const host = window.location.hostname;
-    const port = window.location.port;
-    const use9000 = (port === '9000' || window.location.origin.includes('9000'));
-    const hostPort = use9000 ? (host + ':' + (port || '9000')) : (host + ':9000');
-    return proto + '//' + hostPort + '/ws';
+    return proto + '//' + window.location.host + '/ws';
   }
   const u = new URL(base);
   const wsProto = u.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -26,9 +22,7 @@ function getWsUrl() {
 function getRestUrl(path) {
   const base = getApiBase();
   if (!base) {
-    const origin = window.location.origin;
-    if (origin.includes('9000')) return origin + path;
-    return `${window.location.protocol}//${window.location.hostname}:9000` + path;
+    return window.location.origin + path;
   }
   return base.replace(/\/$/, '') + path;
 }
@@ -139,9 +133,7 @@ async function getSessionMeta(sessionId) {
 }
 
 /**
- * 语义全文分析（按钮触发）
- * transcript: 完整对话转录文本
- * 返回 { analysis, issues, verdict, source }
+ * 语义全文分析（按钮触发，非流式，保留兼容）
  */
 async function semanticAnalyze(transcript) {
   const r = await fetch(getRestUrl('/api/semantic-analyze'), {
@@ -154,6 +146,57 @@ async function semanticAnalyze(transcript) {
     throw new Error('语义分析请求失败: ' + err);
   }
   return r.json();
+}
+
+/**
+ * 流式语义分析（SSE）
+ * onThinkingStart()       — 模型开始思考
+ * onThinkingToken(text)   — 思考过程的 token
+ * onThinkingEnd()         — 思考结束
+ * onToken(text)           — 正文 token
+ * onDone(verdict)         — 生成完成
+ * onError(err)            — 出错
+ */
+async function semanticAnalyzeStream(transcript, callbacks) {
+  var cb = callbacks || {};
+  try {
+    var r = await fetch(getRestUrl('/api/semantic-analyze-stream'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript: transcript }),
+    });
+    if (!r.ok) {
+      var errText = await r.text();
+      if (cb.onError) cb.onError(new Error('请求失败: ' + errText));
+      return;
+    }
+    var reader = r.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '';
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      var lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line.startsWith('data: ')) continue;
+        try {
+          var evt = JSON.parse(line.slice(6));
+          if (evt.type === 'loading' && cb.onLoading) cb.onLoading();
+          else if (evt.type === 'thinking_start' && cb.onThinkingStart) cb.onThinkingStart();
+          else if (evt.type === 'thinking_token' && cb.onThinkingToken) cb.onThinkingToken(evt.text);
+          else if (evt.type === 'thinking_end' && cb.onThinkingEnd) cb.onThinkingEnd();
+          else if (evt.type === 'token' && cb.onToken) cb.onToken(evt.text);
+          else if (evt.type === 'done' && cb.onDone) cb.onDone(evt.verdict);
+          else if (evt.type === 'error' && cb.onError) cb.onError(new Error(evt.text));
+        } catch (e) { /* skip malformed line */ }
+      }
+    }
+  } catch (e) {
+    if (cb.onError) cb.onError(e);
+  }
 }
 
 /**
@@ -212,4 +255,37 @@ function connectWS(sessionId, getFrameBase64, getAudioBase64, getText, intervalM
     if (ticker) clearInterval(ticker);
     ws.close();
   };
+}
+
+// ── 语音测谎 API ──────────────────────────────────────────────────────────
+
+async function uploadAudios(sessionId, fileList) {
+  var fd = new FormData();
+  for (var i = 0; i < fileList.length; i++) {
+    fd.append('files', fileList[i]);
+  }
+  var r = await fetch(getRestUrl('/sessions/' + sessionId + '/audios'), {
+    method: 'POST',
+    body: fd,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function listAudios(sessionId) {
+  var r = await fetch(getRestUrl('/sessions/' + sessionId + '/audios'));
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function analyzeAudio(sessionId, filename) {
+  var r = await fetch(getRestUrl('/sessions/' + sessionId + '/audios/' + encodeURIComponent(filename) + '/analyze'), {
+    method: 'POST',
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function getAudioStreamUrl(sessionId, filename) {
+  return getRestUrl('/sessions/' + sessionId + '/audios/' + encodeURIComponent(filename) + '/stream');
 }

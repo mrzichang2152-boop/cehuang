@@ -6,7 +6,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from backend.services.pipeline import run_pipeline, get_last_bpm
@@ -32,6 +32,15 @@ def _stt_transcribe(session_id: str, audio_b64: str) -> dict:
 async def websocket_analyze(ws: WebSocket):
     await ws.accept()
     loop = asyncio.get_event_loop()
+
+    # 录制开始 → 确保 STT 在 GPU 上（如果 Qwen3 之前占用了 GPU 则让出）
+    try:
+        from backend.services.qwen_semantic_service import release_gpu_for_stt
+        await loop.run_in_executor(_executor, release_gpu_for_stt)
+        logger.info("GPU ready for STT (recording start)")
+    except Exception:
+        logger.exception("Failed to prepare GPU for STT")
+
     try:
         while True:
             raw = await ws.receive_text()
@@ -71,17 +80,19 @@ async def websocket_analyze(ws: WebSocket):
                 await ws.send_json({"type": "error", "detail": str(e)})
                 continue
 
+            dims = {
+                "expression": result.dimensions.expression,
+                "heart_rate": result.dimensions.heart_rate,
+                "tone": result.dimensions.tone,
+                "semantic": result.dimensions.semantic,
+                "emotion_scores": result.dimensions.emotion_scores or {},
+            }
             await ws.send_json({
                 "type": "result",
                 "session_id": session_id,
                 "lie_probability": result.lie_probability,
-                "dimensions": {
-                    "expression": result.dimensions.expression,
-                    "heart_rate": result.dimensions.heart_rate,
-                    "tone": result.dimensions.tone,
-                    "semantic": result.dimensions.semantic,
-                },
-                "bpm": get_last_bpm(session_id),   # 原始心率 bpm，供前端展示
+                "dimensions": dims,
+                "bpm": get_last_bpm(session_id),
                 "semantic_summary": result.semantic_summary,
             })
 
@@ -119,8 +130,8 @@ class SemanticAnalyzeRequest(BaseModel):
 @router.post("/api/semantic-analyze")
 async def semantic_analyze(req: SemanticAnalyzeRequest):
     """
-    接收完整对话转录文本，用本地 LLM 分析逻辑一致性。
-    首次调用会触发模型下载（Qwen2.5-1.5B-Instruct ~3GB），后续从缓存加载。
+    接收完整对话转录文本，用本地 Qwen3-4B (GPU) 分析逻辑一致性。
+    自动进行 GPU 切换：卸载 STT → 加载 Qwen3 → 分析 → 恢复 STT。
     """
     loop = asyncio.get_event_loop()
 
@@ -137,3 +148,42 @@ async def semantic_analyze(req: SemanticAnalyzeRequest):
             status_code=500,
             content={"error": str(e), "analysis": "分析失败", "issues": [], "verdict": "错误"},
         )
+
+
+@router.post("/api/semantic-analyze-stream")
+async def semantic_analyze_stream(req: SemanticAnalyzeRequest):
+    """SSE 流式语义分析：逐 token 推送到前端。"""
+    import queue
+
+    q: queue.Queue = queue.Queue()
+    q.put({"type": "loading"})
+
+    def _produce():
+        try:
+            from backend.services.qwen_semantic_service import stream_full_transcript
+            for event in stream_full_transcript(req.transcript):
+                q.put(event)
+        except Exception as e:
+            logger.exception("stream analysis error")
+            q.put({"type": "error", "text": str(e)})
+        finally:
+            q.put(None)
+
+    import threading
+    threading.Thread(target=_produce, daemon=True).start()
+
+    async def _sse_generator():
+        while True:
+            try:
+                item = await asyncio.get_event_loop().run_in_executor(None, q.get, True, 180)
+            except Exception:
+                break
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
